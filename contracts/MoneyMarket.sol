@@ -66,6 +66,8 @@ contract Lending is Exponential, SafeToken {
         uint interestIndex;
     }
 
+    // TODO: Does Global reserve Pool requires a different struct?
+
     /**
       *  Maps customerAddress to assetAddress to balance for supplies
       */
@@ -79,6 +81,7 @@ contract Lending is Exponential, SafeToken {
 
     /*
      * Maps customerAddress to assetAddress to stake for the assetAddress reserve pool
+     * Local reserve Pools
      */
 
     mapping(address => mapping(address => Balance)) public stakingBalances;
@@ -187,8 +190,14 @@ contract Lending is Exponential, SafeToken {
 
     event UnstakeFromReservePool(address account, address reservePool, uint amount, uint startingBalance, uint newBalance);
 
+    /*
+    * Emit when user supplies in the global reserve pool
+    */
     event ReserveSupplied(address account, uint amount, uint startingBalance, uint newBalance);
 
+    /*
+    * Emit when user supplies withdrawn from the global reserve pool
+    */
     event ReserveWithdrawn(address account, uint amount, uint startingBalance, uint newBalance);
 
     /*
@@ -995,6 +1004,7 @@ contract Lending is Exponential, SafeToken {
             return fail(err, FailureInfo.SUPPLY_NEW_SUPPLY_INDEX_CALCULATION_FAILED);
         }
 
+        // Includes the interest accrued over a period of time
         (err, localResults.userSupplyCurrent) = calculateBalance(balance.principal, balance.interestIndex, localResults.newSupplyIndex);
         if (err != Error.NO_ERROR) {
             return fail(err, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED);
@@ -1065,15 +1075,63 @@ contract Lending is Exponential, SafeToken {
         return uint(Error.NO_ERROR); // success
     }
 
+    /**
+      * The `SupplyReserveLocalVars` struct is used internally in the `supplyToReservePool` function.
+      * Instead of SupplyLocalVars this struct is created because there would not be interest parameters for the reserve pool
+      */
+    //   TODO: Check for refactoring and improvement
+    struct SupplyReserveLocalVars {
+        uint userStartingReserve;
+        uint userUpdatedReserve;
+        // uint newTotalSupply;  //As of now we are not tracking the total reserve pool balance
+        uint currentCash;   //Not Sure whether to include it or not, but including it for now
+        uint updatedCash;
+    }
 
+    /**
+      * @notice supply `amount` of `asset` to the global reserve pool of asset mapped to `msg.sender` in the protocol
+      *     assuming that over time the liquidation bonus will be added to the local reserve pools(stakingBalances)
+      *     hence overtime it would be constant unless withdrawn
+      * @dev add amount of asset to the globalReservePool Balance mapping
+      * @param asset The market asset to supply
+      * @param amount The amount to supply
+      * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+      */
     function supplyToReservePool(address asset, uint amount){
         if (paused) {
             return fail(Error.CONTRACT_PAUSED, FailureInfo.SUPPLY_CONTRACT_PAUSED);
         }
 
-        Market storage market = markets[asset];
-        Balance storage balance = reserveBalances[msg.sender][asset];
+        Balance storage balance = globalReservePoolBalances[msg.sender][asset];
 
+        SupplyReserveLocalVars memory localResults;
+        Error err;
+
+        // Need to see how to implement supporting of global reserve pool assets
+        // if (!market.isSupported) {
+        //     return fail(Error.MARKET_NOT_SUPPORTED, FailureInfo.SUPPLY_MARKET_NOT_SUPPORTED);
+        // }
+
+        // Fail gracefully if asset is not approved or has insufficient balance
+        err = checkTransferIn(asset, msg.sender, amount);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.SUPPLY_TRANSFER_IN_NOT_POSSIBLE);
+        }
+
+        localResults.userStartingReserve = balance.principal;
+
+        (err, localResults.userUpdatedReserve) = add(localResults.userStartingReserve, amount);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.SUPPLY_NEW_TOTAL_RESERVE_CALCULATION_FAILED);
+        }
+
+        // Saving User Updates
+        balance.principal = localResults.userUpdatedReserve;
+        // TODO: Figure out what to update in interestIndex or the corresponding attribute in the new reserve struct
+
+        emit ReserveSupplied(asset, amount, localResults.userStartingReserve, localResults.userUpdatedReserve);
+
+        return uint(Error.NO_ERROR);
 
     }
 
@@ -1104,7 +1162,7 @@ contract Lending is Exponential, SafeToken {
       * @param requestedAmount The amount to withdraw (or -1 for max)
       * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
       */
-    function withdraw(address asset, uint requestedAmount) public returns (uint) {
+    function withdrawFromLendingPool(address asset, uint requestedAmount) public returns (uint) {
         if (paused) {
             return fail(Error.CONTRACT_PAUSED, FailureInfo.WITHDRAW_CONTRACT_PAUSED);
         }
@@ -1232,6 +1290,12 @@ contract Lending is Exponential, SafeToken {
 
         return uint(Error.NO_ERROR); // success
     }
+
+    // function withdrawFromGlobalReservePool(address asset, uint amount) {
+    //     if (paused) {
+    //         return fail(Error.CONTRACT_PAUSED, FailureInfo.SUPPLY_CONTRACT_PAUSED);
+    //     }
+    // }
 
     struct AccountValueLocalVars {
         address assetAddress;
