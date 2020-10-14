@@ -1107,7 +1107,7 @@ contract Lending is Exponential, SafeToken {
         SupplyReserveLocalVars memory localResults;
         Error err;
 
-        // Need to see how to implement supporting of global reserve pool assets
+        // TODO: Need to see how to implement supporting of global reserve pool assets
         // if (!market.isSupported) {
         //     return fail(Error.MARKET_NOT_SUPPORTED, FailureInfo.SUPPLY_MARKET_NOT_SUPPORTED);
         // }
