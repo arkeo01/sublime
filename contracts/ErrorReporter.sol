@@ -43,6 +43,7 @@ contract ErrorReporter {
      *       the order of Error has some meaning, while the order of FailureInfo
      *       is entirely arbitrary.
      */
+    //  TODO: Add reserve specific FailureInfo here.
     enum FailureInfo {
         ACCEPT_ADMIN_PENDING_ADMIN_CHECK,
         BORROW_ACCOUNT_LIQUIDITY_CALCULATION_FAILED,

@@ -28,6 +28,7 @@ contract Lending is Exponential, SafeToken {
         collateralRatio = Exp({mantissa: 2 * mantissaOne});  //Exp({mantissa: 2 * mantissaOne});
         transactionFee = Exp({mantissa: defaultTransactionFee}); //Exp({mantissa: defaultOriginationFee});
         liquidationDiscount = Exp({mantissa: 0}); // Initially discount is set to Exp({mantissa: 0});
+        gamma = 0.5; //Interest Redistribution Parameter
     }
 
     /**
@@ -65,8 +66,6 @@ contract Lending is Exponential, SafeToken {
         uint principal;
         uint interestIndex;
     }
-
-    // TODO: Does Global reserve Pool requires a different struct?
 
     /**
       *  Maps customerAddress to assetAddress to balance for supplies
@@ -108,6 +107,7 @@ contract Lending is Exponential, SafeToken {
       *         borrowIndex = the interest index for borrows of asset as of blockNumber; initialized in _supportMarket
       *     }
       */
+    // TODO: Make corresponding supply/borrowRateMantissa -> supply/borrowInterestRateExp change in code
     struct Market {
         bool isSupported;
         uint lastUpdatedBlockNumber;
@@ -193,12 +193,12 @@ contract Lending is Exponential, SafeToken {
     /*
     * Emit when user supplies in the global reserve pool
     */
-    event ReserveSupplied(address account, uint amount, uint startingBalance, uint newBalance);
+    event ReserveSupplied(address account, address asset, uint amount, uint startingBalance, uint newBalance);
 
     /*
     * Emit when user supplies withdrawn from the global reserve pool
     */
-    event ReserveWithdrawn(address account, uint amount, uint startingBalance, uint newBalance);
+    event ReserveWithdrawn(address account, address asset, uint amount, uint startingBalance, uint newBalance);
 
     /*
      *  DID NOT INCLUDE borrowBalanceAccumulated, collateralBalanceAccumulated, liquidator
@@ -1077,23 +1077,29 @@ contract Lending is Exponential, SafeToken {
 
     /**
       * The `SupplyReserveLocalVars` struct is used internally in the `supplyToReservePool` function.
-      * Instead of SupplyLocalVars this struct is created because there would not be interest parameters for the reserve pool
+      * Struct Attributes added/modified
       */
-    //   TODO: Check for refactoring and improvement
     struct SupplyReserveLocalVars {
-        uint userStartingReserve;
-        uint userUpdatedReserve;
-        // uint newTotalSupply;  //As of now we are not tracking the total reserve pool balance
-        uint currentCash;   //Not Sure whether to include it or not, but including it for now
+        uint startingReserveBalance;//Changed to ReserveBalance
+        uint newSupplyIndex;
+        uint newReserveIndex;       // ( 1 - Interest Redistribution Parameter) * newSupplyIndex
+        uint userReserveCurrent;    // Changed to Reserve
+        uint userReserveUpdated;    // Changed to Reserve
+        uint newTotalReserve;       // Changed to Reserve
+        uint currentCash;
         uint updatedCash;
+        uint newSupplyRateMantissa;
+        uint newBorrowIndex;
+        uint newBorrowRateMantissa;
     }
 
     /**
       * @notice supply `amount` of `asset` to the global reserve pool of asset mapped to `msg.sender` in the protocol
-      *     assuming that over time the liquidation bonus will be added to the local reserve pools(stakingBalances)
+      *     just considering gamma * interest rate accruals for now
+      *     not considering liquidation discount accruals
       *     hence overtime it would be constant unless withdrawn
       * @dev add amount of asset to the globalReservePool Balance mapping
-      * @param asset The market asset to supply
+      * @param asset The market asset to supply, same asset market for both liquidation and reserve pools
       * @param amount The amount to supply
       * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
       */
@@ -1102,34 +1108,97 @@ contract Lending is Exponential, SafeToken {
             return fail(Error.CONTRACT_PAUSED, FailureInfo.SUPPLY_CONTRACT_PAUSED);
         }
 
+        Market storage market = markets[asset];
         Balance storage balance = globalReservePoolBalances[msg.sender][asset];
 
-        SupplyReserveLocalVars memory localResults;
+        SupplyReserveLocalVars memory localResults; // Holds all our uint calculation results
         Error err;
+        uint rateCalculationResultCode; // Used for 2 interest rate calculation calls
+        uint oneMinusGamma;
 
-        // TODO: Need to see how to implement supporting of global reserve pool assets
-        // if (!market.isSupported) {
-        //     return fail(Error.MARKET_NOT_SUPPORTED, FailureInfo.SUPPLY_MARKET_NOT_SUPPORTED);
-        // }
+        // Fail if the market is not supported
+        if (!market.isSupported) {
+            return fail(Error.MARKET_NOT_SUPPORTED, FailureInfo.SUPPLY_MARKET_NOT_SUPPORTED);
+        }
 
         // Fail gracefully if asset is not approved or has insufficient balance
         err = checkTransferIn(asset, msg.sender, amount);
         if (err != Error.NO_ERROR) {
-            return fail(err, FailureInfo.SUPPLY_TRANSFER_IN_NOT_POSSIBLE);
+            return fail(err, FailureInfo.RESERVE_TRANSFER_IN_NOT_POSSIBLE);
         }
 
-        localResults.userStartingReserve = balance.principal;
-
-        (err, localResults.userUpdatedReserve) = add(localResults.userStartingReserve, amount);
+        // We calculate the newSupplyIndex, user's supplyCurrent and supplyUpdated for the asset
+        (err, localResults.newSupplyIndex) = calculateInterestIndex(market.supplyIndex, market.supplyRateMantissa, market.blockNumber, getBlockNumber());
         if (err != Error.NO_ERROR) {
-            return fail(err, FailureInfo.SUPPLY_NEW_TOTAL_RESERVE_CALCULATION_FAILED);
+            return fail(err, FailureInfo.SUPPLY_NEW_SUPPLY_INDEX_CALCULATION_FAILED);
         }
 
-        // Saving User Updates
-        balance.principal = localResults.userUpdatedReserve;
-        // TODO: Figure out what to update in interestIndex or the corresponding attribute in the new reserve struct
+        // newReserveIndex = gamma(1- Interest redis. param.) * newSupplyIndex
+        // 1 - gamma
+        (err, oneMinusGamma) = sub(1, gamma);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.ONE_MINUS_GAMMA_CALCULATION_FAILED);
+        }
 
-        emit ReserveSupplied(asset, amount, localResults.userStartingReserve, localResults.userUpdatedReserve);
+        // TODO: Refactor to include reservePremiumRateExp instead of newReserveIndex
+        // oneMinusGamma * newSupplyIndex
+        (err, localResults.newReserveIndex) = mul(oneMinusGamma, localResults.newSupplyIndex);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.RESERVE_NEW_RESERVE_INDEX_CALCULATION_FAILED);
+        }
+
+        // Includes the interest accrued over a period of time multiplied by gamma
+        (err, localResults.userReserveCurrent) = calculateBalance(balance.principal, balance.interestIndex, localResults.newReserveIndex);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.RESERVE_ACCUMULATED_BALANCE_CALCULATION_FAILED);
+        }
+
+        (err, localResults.userReserveUpdated) = add(localResults.userReserveCurrent, amount);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.RESERVE_NEW_TOTAL_BALANCE_CALCULATION_FAILED);
+        }
+
+        // We calculate the protocol's totalReserve by subtracting the user's prior checkpointed balance, adding user's updated supply
+        (err, localResults.newTotalReserve) = addThenSub(market.totalReserve, localResults.userReserveUpdated, balance.principal);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.RESERVE_NEW_TOTAL_SUPPLY_CALCULATION_FAILED);
+        }
+
+        // We need to calculate what the updated cash will be after we transfer in from user
+        localResults.currentCash = getCash(asset);
+
+        (err, localResults.updatedCash) = add(localResults.currentCash, amount);
+        if (err != Error.NO_ERROR) {
+            return fail(err, FailureInfo.RESERVE_NEW_TOTAL_CASH_CALCULATION_FAILED);
+        }
+
+        // TODO: Check for Refactoring
+        // No Change in Utilization Ratio, as the cash is not added in the lending pool
+
+        /////////////////////////
+        // EFFECTS & INTERACTIONS
+        // (No safe failures beyond this point)
+
+        // We ERC-20 transfer the asset into the protocol (note: pre-conditions already checked above)
+        err = doTransferIn(asset, msg.sender, amount);
+        if (err != Error.NO_ERROR) {
+            // This is safe since it's our first interaction and it didn't do anything if it failed
+            return fail(err, FailureInfo.RESERVE_TRANSFER_IN_FAILED);
+        }
+
+        // Save market updates
+        market.blockNumber = getBlockNumber();
+        market.totalReserve =  localResults.newTotalReserve;
+        market.reserveIndex = localResults.newReserveIndex;
+        // market.supplyIndex = localResults.newSupplyIndex;
+        // market.borrowRateMantissa = localResults.newBorrowRateMantissa;
+        // market.borrowIndex = localResults.newBorrowIndex;
+
+        localResults.startingReserveBalance = balance.principal;
+        balance.principal = localResults.userReserveUpdated;
+        balance.interestIndex = localResults.newReserveIndex;
+
+        emit ReserveSupplied(msg.sender, asset, amount, localResults.startingReserveBalance, localResults.userReserveUpdated);
 
         return uint(Error.NO_ERROR);
 
